@@ -46,6 +46,7 @@
 #include <string.h>
 #include <semaphore.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <assert.h>
 #include <errno.h>
 #include <debug.h>
@@ -96,6 +97,9 @@ static int            can_xmit(FAR struct can_dev_s *dev);
 static ssize_t        can_write(FAR struct file *filep, FAR const char *buffer, size_t buflen);
 static inline ssize_t can_rtrread(FAR struct can_dev_s *dev, FAR struct canioctl_rtr_s *rtr);
 static int            can_ioctl(FAR struct file *filep, int cmd, unsigned long arg);
+#ifndef CONFIG_DISABLE_POLL
+static int            can_poll(FAR struct file *filep, FAR struct pollfd *fds, bool setup);
+#endif
 
 /****************************************************************************
  * Private Data
@@ -110,13 +114,33 @@ static const struct file_operations g_canops =
   0,         /* seek */
   can_ioctl  /* ioctl */
 #ifndef CONFIG_DISABLE_POLL
-  , 0        /* poll */
+  , can_poll        /* poll */
 #endif
 };
 
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
+
+#ifndef CONFIG_DISABLE_POLL
+static void can_pollnotify(FAR struct can_dev_s *dev, pollevent_t eventset)
+{
+    int i;
+
+    for (i = 0; i < CONFIG_CAN_NPOLLWAITERS; i++) {
+        struct pollfd *fds = dev->fds[i];
+        if (fds) {
+            fds->revents |= (fds->events & eventset);
+
+            if (fds->revents != 0) {
+                sem_post(fds->sem);
+            }
+        }
+    }
+}
+#else
+#   define can_pollnotify(dev,event)
+#endif
 
 /************************************************************************************
  * Name: can_open
@@ -787,6 +811,9 @@ int can_receive(FAR struct can_dev_s *dev, FAR struct can_hdr_s *hdr, FAR uint8_
       sem_post(&fifo->rx_sem);
       err = OK;
     }
+
+  can_pollnotify(dev, POLLIN);
+
   return err;
 }
 
@@ -839,7 +866,80 @@ int can_txdone(FAR struct can_dev_s *dev)
           ret = sem_post(&dev->cd_xmit.tx_sem);
         }
     }
+
+  can_pollnotify(dev, POLLOUT);
+
   return ret;
 }
+
+/************************************************************************************
+ * Name: can_poll
+ ************************************************************************************/
+
+#ifndef CONFIG_DISABLE_POLL
+int can_poll(FAR struct file *filep, FAR struct pollfd *fds, bool setup)
+{
+    FAR struct inode     *inode    = filep->f_inode;
+    FAR struct can_dev_s *dev      = inode->i_private;
+    FAR struct can_txfifo_s *txfifo  = &dev->cd_xmit;
+    FAR struct can_rxfifo_s *rxfifo  = &dev->cd_recv;
+    pollevent_t           eventset;
+    irqstate_t            flags;
+    int                   ret = 0;
+    int                   nexttail;
+    int                   i;
+
+    if (setup) {
+        for (i = 0; i < CONFIG_CAN_NPOLLWAITERS; i++) {
+            if (!dev->fds[i]) {
+                dev->fds[i] = fds;
+                fds->priv   = &dev->fds[i];
+                break;
+            }
+        }
+
+        if (i >= CONFIG_CAN_NPOLLWAITERS) {
+            fds->priv   = NULL;
+            ret         = -EBUSY;
+            goto errout;
+        }
+
+        eventset = 0;
+        // TODO: take xmit semaphore ?
+
+        flags = irqsave();
+        
+        // check if the xmit buffer is full
+        nexttail = txfifo->tx_tail + 1;
+        if (nexttail >= CONFIG_CAN_FIFOSIZE) {
+            nexttail = 0;
+        }
+
+        if (nexttail != txfifo->tx_head) {
+            eventset |= (fds->events & POLLOUT);
+        }
+
+        // check if the receive buffer is empty
+        if (rxfifo->rx_head != rxfifo->rx_tail) {
+            eventset |= (fds->events & POLLIN);
+        }
+
+        irqrestore(flags);
+
+
+        if (eventset) {
+            can_pollnotify(dev, eventset);
+        }
+    } else if (fds->priv) {
+        struct pollfd **slot = (struct pollfd **)fds->priv;
+
+        *slot       = NULL;
+        fds->priv   = NULL;
+    }
+
+errout:
+    return ret;
+}
+#endif /* CONFIG_DISABLE_POLL */
 
 #endif /* CONFIG_CAN */

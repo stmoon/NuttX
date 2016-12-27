@@ -52,6 +52,10 @@
 
 #ifdef CONFIG_CAN
 
+#ifndef CONFIG_CAN_NPOLLWAITERS
+#  define CONFIG_CAN_NPOLLWAITERS 2
+#endif
+
 /************************************************************************************
  * Pre-processor Definitions
  ************************************************************************************/
@@ -292,6 +296,10 @@ struct can_dev_s
   struct can_rtrwait_s cd_rtr[CONFIG_CAN_NPENDINGRTR];
   FAR const struct can_ops_s *cd_ops;    /* Arch-specific operations */
   FAR void            *cd_priv;          /* Used by the arch-specific logic */
+
+#ifndef CONFIG_DISABLE_POLL
+  struct pollfd *fds[CONFIG_CAN_NPOLLWAITERS];
+#endif
 };
 
 /* Structures used with ioctl calls */
